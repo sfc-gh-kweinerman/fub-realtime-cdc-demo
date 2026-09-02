@@ -1,0 +1,12 @@
+definition_version: "2"
+entities:
+  fub_banking_demo:
+    type: snowflake-app
+    identifier:
+      name: fub_banking_demo
+    artifacts:
+      - src: "."
+        dest: "."
+    compute_pool: FUB_DEMO_POOL
+    external_access_integrations:
+      - SNOWFLAKE_EGRESS_EAI   # allows outbound calls to poller/generator when co-located

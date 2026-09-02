@@ -1,0 +1,25 @@
+# SQL Server connectivity
+pyodbc==5.1.0
+
+# Snowflake - direct MERGE path (hybrid tables)
+snowflake-connector-python==3.12.0
+snowflake-sqlalchemy==1.6.1
+sqlalchemy==2.0.35
+
+# Snowpipe Streaming SDK (optional - requires key pair auth)
+snowflake-ingest>=1.0.13
+
+# Cryptography for loading private keys (Snowpipe Streaming)
+cryptography>=42.0.0
+
+# Synthetic data generation
+faker==28.0.0
+numpy==1.26.4
+
+# HTTP control / metrics server
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+httpx==0.27.2
+
+# Utilities
+python-dotenv==1.0.1

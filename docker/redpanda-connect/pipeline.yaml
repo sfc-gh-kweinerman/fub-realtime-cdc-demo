@@ -1,0 +1,108 @@
+# =============================================================================
+# Redpanda Connect Pipeline: CDC events -> sql_raw MERGE -> Snowflake Hybrid Table
+# =============================================================================
+#
+# This pipeline reads CDC events from Redpanda (published by Debezium) and
+# executes MERGE directly against Snowflake hybrid tables using the sql_raw
+# output. This replaces the Dynamic Table pattern (1-min lag) with sub-5-sec
+# end-to-end latency.
+#
+# The Debezium connector is configured with ExtractNewRecordState (unwrap)
+# transform, so messages arrive as flat JSON with __op and __source_ts_ms
+# fields added.
+
+input:
+  kafka:
+    addresses: ["redpanda:29092"]
+    topics: ["fub.JackHenry.dbo.member_updates"]
+    consumer_group: "snowflake-merge"
+    start_from_oldest: true
+    batching:
+      count: 50
+      period: "500ms"
+
+pipeline:
+  processors:
+    - mapping: |
+        let p = if this.type() == "string" { this.parse_json().payload } else { this.payload }
+        root = $p
+        root.is_delete = $p.__deleted == "true"
+        root.ssn_last4 = if $p.ssn_last4 != null { ($p.ssn_last4).string().trim() } else { "" }
+        root.last_name = if $p.last_name != null { ($p.last_name).string() } else { "" }
+        root.first_name = if $p.first_name != null { ($p.first_name).string() } else { null }
+        root.email = if $p.email != null { ($p.email).string() } else { null }
+        root.phone = if $p.phone != null { ($p.phone).string() } else { null }
+        root.street = if $p.street != null { ($p.street).string() } else { null }
+        root.city = if $p.city != null { ($p.city).string() } else { null }
+        root.state = if $p.state != null { ($p.state).string() } else { null }
+        root.zip = if $p.zip != null { ($p.zip).string() } else { null }
+        root.skip = root.ssn_last4 == "" || root.last_name == ""
+
+output:
+  sql_raw:
+    driver: snowflake
+    dsn: "${SNOWFLAKE_DSN}"
+
+    conn_max_open: 4
+    conn_max_idle: 2
+    conn_max_life_time: "5m"
+
+    queries:
+      # Skip records with null/empty match keys
+      - when: 'this.skip == true'
+        query: "SELECT 1"
+
+      # Handle deletes
+      - when: 'this.is_delete == true && this.skip != true'
+        query: |
+          DELETE FROM member_master_ht
+          WHERE ssn_last4 = ? AND last_name = ?
+        args_mapping: |
+          root = [this.ssn_last4, this.last_name]
+
+      # Handle inserts and updates via MERGE
+      - when: 'this.is_delete != true && this.skip != true'
+        query: |
+          MERGE INTO member_master_ht AS tgt
+          USING (
+              SELECT ? AS ssn_last4, ? AS last_name, ? AS first_name,
+                     ? AS email, ? AS phone, ? AS street,
+                     ? AS city, ? AS state, ? AS zip
+          ) AS src
+          ON tgt.ssn_last4 = src.ssn_last4 AND tgt.last_name = src.last_name
+          WHEN MATCHED THEN UPDATE SET
+              tgt.first_name        = COALESCE(src.first_name, tgt.first_name),
+              tgt.email             = COALESCE(src.email, tgt.email),
+              tgt.phone             = COALESCE(src.phone, tgt.phone),
+              tgt.street            = COALESCE(src.street, tgt.street),
+              tgt.city              = COALESCE(src.city, tgt.city),
+              tgt.state             = COALESCE(src.state, tgt.state),
+              tgt.zip               = COALESCE(src.zip, tgt.zip),
+              tgt.source_system     = 'REDPANDA_CDC',
+              tgt.updated_at        = CURRENT_TIMESTAMP()
+          WHEN NOT MATCHED THEN INSERT
+              (member_id, ssn_last4, last_name, first_name, email, phone,
+               street, city, state, zip, source_system, updated_at)
+              VALUES
+              (member_master_ht_seq.NEXTVAL, src.ssn_last4, src.last_name,
+               src.first_name, src.email, src.phone, src.street,
+               src.city, src.state, src.zip,
+               'REDPANDA_CDC', CURRENT_TIMESTAMP())
+        args_mapping: |
+          root = [
+            this.ssn_last4,
+            this.last_name,
+            this.first_name,
+            this.email,
+            this.phone,
+            this.street,
+            this.city,
+            this.state,
+            this.zip
+          ]
+
+    max_in_flight: 4
+
+# Expose metrics at http://localhost:4195/metrics for monitoring
+http:
+  address: "0.0.0.0:4195"

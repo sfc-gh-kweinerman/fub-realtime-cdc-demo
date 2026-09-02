@@ -1,0 +1,110 @@
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: fub_sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "FUBDemo!2026"
+      MSSQL_PID: Developer
+      MSSQL_AGENT_ENABLED: "true"
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+    healthcheck:
+      test: >
+        /opt/mssql-tools18/bin/sqlcmd
+        -S localhost -U sa -P "FUBDemo!2026"
+        -Q "SELECT 1" -No -C
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  # ── Redpanda: single-node broker (Kafka-compatible) ────────
+  redpanda:
+    image: redpandadata/redpanda:latest
+    container_name: fub_redpanda
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 512M
+      - --overprovisioned
+      - --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+      - --pandaproxy-addr PLAINTEXT://0.0.0.0:8082,OUTSIDE://0.0.0.0:18082
+      - --advertise-pandaproxy-addr PLAINTEXT://redpanda:8082,OUTSIDE://localhost:18082
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+      - "18082:18082"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ── Debezium Connect: captures SQL Server CDC -> Redpanda ──
+  debezium:
+    image: debezium/connect:2.7.3.Final
+    container_name: fub_debezium
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: "redpanda:29092"
+      GROUP_ID: "fub-cdc"
+      CONFIG_STORAGE_TOPIC: "_debezium_configs"
+      OFFSET_STORAGE_TOPIC: "_debezium_offsets"
+      STATUS_STORAGE_TOPIC: "_debezium_status"
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  # ── Redpanda Connect: Redpanda topic -> sql_raw MERGE -> Snowflake ──
+  redpanda-connect:
+    image: redpandadata/connect:latest
+    container_name: fub_rp_connect
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "4195:4195"
+    volumes:
+      - ./redpanda-connect/pipeline.yaml:/pipeline.yaml:ro
+    env_file:
+      - ./redpanda-connect/.env
+    command: ["run", "/pipeline.yaml"]
+
+  # ── Redpanda Console: web UI to inspect topics/messages ────
+  redpanda-console:
+    image: redpandadata/console:latest
+    container_name: fub_console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_BROKERS: "redpanda:29092"
+      KAFKA_SCHEMAREGISTRY_ENABLED: "false"
+      CONNECT_ENABLED: "true"
+      CONNECT_CLUSTERS_NAME: "fub-debezium"
+      CONNECT_CLUSTERS_URL: "http://debezium:8083"
+
+volumes:
+  sqlserver_data:
+  redpanda_data:

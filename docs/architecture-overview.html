@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="snowflake-source" content="cortex-agent-authored" />
+  <title>Real-Time CDC MERGE: Redpanda + Snowflake Hybrid Tables</title>
+  <script type="application/json" id="snowflake-report-metadata">
+  {
+    "generated": "2026-09-01",
+    "intent": "Architecture reference for replacing Dynamic Table MERGE (1-min lag) with Redpanda Connect sql_raw MERGE into Snowflake Hybrid Tables (sub-5-sec)",
+    "sections": [
+      { "id": "problem", "title": "The Problem" },
+      { "id": "architecture", "title": "Proposed Architecture" },
+      { "id": "why-hybrid", "title": "Why Hybrid Tables" },
+      { "id": "config", "title": "Redpanda Connect Config" },
+      { "id": "next-steps", "title": "Next Steps" }
+    ]
+  }
+  </script>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
+      max-width: 960px; width: 100%; margin: 0 auto;
+      padding: clamp(16px, 4vw, 32px);
+      color: light-dark(#1e293b, #e2e8f0);
+      background: light-dark(#ffffff, #0f172a);
+      line-height: 1.6;
+    }
+    h1 { font-size: clamp(1.5rem, 4vw, 2rem); margin-bottom: 0.25em; color: light-dark(#0f172a, #f1f5f9); }
+    h2 { font-size: 1.3rem; margin-top: 2em; padding-bottom: 0.3em; border-bottom: 2px solid light-dark(#e2e8f0, #334155); color: light-dark(#0f172a, #f1f5f9); }
+    h3 { font-size: 1.05rem; color: light-dark(#334155, #cbd5e1); }
+    .subtitle { color: light-dark(#64748b, #94a3b8); font-size: 1.05rem; margin-top: 0; }
+    a { color: light-dark(#2563eb, #60a5fa); }
+    img, svg { max-width: 100%; height: auto; }
+    .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin: 24px 0; }
+    .card { background: light-dark(#f8fafc, #1e293b); border: 1px solid light-dark(#e2e8f0, #334155); border-radius: 10px; padding: 20px; text-align: center; }
+    .card .big { font-size: 2rem; font-weight: 700; }
+    .card .label { font-size: 0.85rem; color: light-dark(#64748b, #94a3b8); margin-top: 4px; }
+    .card.red .big { color: light-dark(#dc2626, #f87171); }
+    .card.green .big { color: light-dark(#16a34a, #4ade80); }
+    .card.blue .big { color: light-dark(#2563eb, #60a5fa); }
+    .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 24px 0; }
+    @media (max-width: 640px) { .compare { grid-template-columns: 1fr; } }
+    .compare-box { background: light-dark(#f8fafc, #1e293b); border: 1px solid light-dark(#e2e8f0, #334155); border-radius: 10px; padding: 20px; }
+    .compare-box.before { border-top: 3px solid light-dark(#dc2626, #f87171); }
+    .compare-box.after { border-top: 3px solid light-dark(#16a34a, #4ade80); }
+    .compare-box h3 { margin-top: 0; }
+    pre { background: light-dark(#1e293b, #0c1222); color: #e2e8f0; border-radius: 8px; padding: 16px; overflow-x: auto; font-size: 0.82rem; line-height: 1.5; }
+    code { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; }
+    .ic { background: light-dark(#f1f5f9, #1e293b); padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+    .table-wrap { overflow-x: auto; margin: 16px 0; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+    th, td { border: 1px solid light-dark(#d1d5db, #374151); padding: 8px 12px; text-align: left; }
+    th { background: light-dark(#f3f4f6, #1e293b); font-weight: 600; }
+    .callout { background: light-dark(#eff6ff, #172554); border-left: 4px solid light-dark(#2563eb, #60a5fa); border-radius: 0 8px 8px 0; padding: 16px 20px; margin: 20px 0; }
+    .callout-warn { background: light-dark(#fef3c7, #451a03); border-left-color: light-dark(#d97706, #fbbf24); }
+    .tag { display: inline-block; font-size: 0.75rem; font-weight: 600; padding: 2px 8px; border-radius: 4px; margin-right: 6px; }
+    .tag-red { background: light-dark(#fecaca, #7f1d1d); color: light-dark(#991b1b, #fca5a5); }
+    .tag-green { background: light-dark(#bbf7d0, #14532d); color: light-dark(#166534, #86efac); }
+    ul, ol { padding-left: 1.5em; }
+    li { margin-bottom: 0.4em; }
+    .section-divider { border: none; border-top: 1px solid light-dark(#e2e8f0, #334155); margin: 2em 0; }
+    .diagram-wrap { overflow-x: auto; margin: 24px 0; text-align: center; }
+    .diagram-wrap svg { display: inline-block; }
+  </style>
+</head>
+<body>
+
+  <h1>Real-Time CDC MERGE Architecture</h1>
+  <p class="subtitle">Redpanda Connect <code class="ic">sql_raw</code> + Snowflake Hybrid Tables</p>
+
+  <div class="card-grid">
+    <div class="card red"><div class="big">60s+</div><div class="label">Current: Dynamic Table refresh</div></div>
+    <div class="card green"><div class="big">&lt; 5s</div><div class="label">Proposed: sql_raw MERGE</div></div>
+    <div class="card blue"><div class="big">0</div><div class="label">Custom code needed</div></div>
+  </div>
+
+  <!-- ─── Problem ──────────────────────────────────────── -->
+  <h2 id="problem">The Problem</h2>
+  <p>CDC events from Redpanda need to be matched and merged into a target table in Snowflake. The current architecture lands events via <code class="ic">snowflake_streaming</code> into a staging table, then a Dynamic Table performs the MERGE on a 1-minute refresh cycle.</p>
+
+  <div class="compare">
+    <div class="compare-box before">
+      <h3><span class="tag tag-red">CURRENT</span> Dynamic Table Path</h3>
+      <div class="diagram-wrap" id="diagram-before"></div>
+      <p><strong>Bottleneck:</strong> Dynamic Tables have a <strong>minimum 1-minute</strong> TARGET_LAG. <code class="ic">snowflake_streaming</code> is INSERT-only and cannot target Hybrid Tables.</p>
+    </div>
+    <div class="compare-box after">
+      <h3><span class="tag tag-green">PROPOSED</span> sql_raw + Hybrid Table</h3>
+      <div class="diagram-wrap" id="diagram-after"></div>
+      <p><strong>Result:</strong> No staging table, no Dynamic Table, no scheduling delay. End-to-end latency <strong>under 5 seconds</strong>.</p>
+    </div>
+  </div>
+
+  <!-- ─── Full Architecture ────────────────────────────── -->
+  <h2 id="architecture">Proposed Architecture</h2>
+  <div class="diagram-wrap" id="diagram-full"></div>
+
+  <div class="callout">
+    <strong>Key insight:</strong> <code class="ic">sql_raw</code> uses a standard SQL driver connection (same as JDBC/ODBC), NOT the Snowpipe Streaming API. This gives it full DML support: MERGE, UPDATE, DELETE against any table type including Hybrid Tables.
+  </div>
+
+  <!-- ─── Latency ──────────────────────────────────────── -->
+  <h2>Latency Comparison</h2>
+  <div class="diagram-wrap" id="diagram-latency"></div>
+
+  <div class="card-grid">
+    <div class="card"><div class="big">~500ms</div><div class="label">Redpanda consumer lag</div></div>
+    <div class="card"><div class="big">~150ms</div><div class="label">MERGE execution (indexed)</div></div>
+    <div class="card green"><div class="big">~1-3s</div><div class="label">Total end-to-end</div></div>
+  </div>
+
+  <!-- ─── Why Hybrid Tables ────────────────────────────── -->
+  <h2 id="why-hybrid">Why Hybrid Tables Are the Right Target</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Feature</th><th>Standard Table</th><th>Hybrid Table</th><th>Why it matters</th></tr></thead>
+      <tbody>
+        <tr><td>Locking</td><td>Table-level</td><td><strong>Row-level</strong></td><td>Concurrent MERGEs don't block reads</td></tr>
+        <tr><td>Primary Keys</td><td>Not enforced</td><td><strong>Enforced</strong></td><td>Prevents duplicates at storage layer</td></tr>
+        <tr><td>Secondary Indexes</td><td>Search Optimization (async)</td><td><strong>Immediate indexes</strong></td><td>MERGE ON clause uses indexed lookup</td></tr>
+        <tr><td>Point Reads</td><td>Scan-based</td><td><strong>Sub-100ms</strong></td><td>Fast application serving</td></tr>
+        <tr><td>MERGE Support</td><td>Yes (table-lock)</td><td><strong>Yes (row-lock)</strong></td><td>High-concurrency upsert workloads</td></tr>
+        <tr><td>Snowpipe Streaming</td><td>Supported</td><td><strong>Not supported</strong></td><td>Must use SQL driver (sql_raw)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Why Not These Alternatives?</h2>
+  <div class="callout callout-warn">
+    <strong><code class="ic">snowflake_streaming</code> output:</strong> Uses the Snowpipe Streaming API which is INSERT-only and does not support Hybrid Tables. Cannot MERGE, UPDATE, or DELETE.
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Approach</th><th>Latency</th><th>Limitation</th></tr></thead>
+      <tbody>
+        <tr><td><code class="ic">snowflake_streaming</code> + Dynamic Table</td><td>60+ seconds</td><td>DT minimum refresh is 1 minute</td></tr>
+        <tr><td><code class="ic">snowflake_streaming</code> + Stream + Task</td><td>60+ seconds</td><td>Task minimum schedule is 1 minute</td></tr>
+        <tr><td><code class="ic">snowflake_streaming</code> + SOS on standard table</td><td>Minutes</td><td>No MERGE; requires dedup in every query</td></tr>
+        <tr><td><strong><code class="ic">sql_raw</code> + Hybrid Table</strong></td><td><strong>&lt; 5 seconds</strong></td><td><strong>None for this workload</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <hr class="section-divider" />
+
+  <!-- ─── Config ───────────────────────────────────────── -->
+  <h2 id="config">Redpanda Connect Configuration</h2>
+  <p>The entire pipeline is a single YAML file. No Python, no Java, no custom consumer application.</p>
+  <h3>Pipeline: Kafka Input + sql_raw MERGE Output</h3>
+  <pre><code>input:
+  kafka:
+    addresses: ["${REDPANDA_BROKERS}"]
+    topics: ["member-cdc-events"]
+    consumer_group: "snowflake-merge-consumer"
+    batching:
+      count: 50
+      period: "500ms"
+
+output:
+  sql_raw:
+    driver: snowflake
+    dsn: "${SNOWFLAKE_DSN}"
+    queries:
+      # Route deletes
+      - when: 'this.op == "d"'
+        query: |
+          DELETE FROM member_master_ht
+          WHERE ssn_last4 = ? AND last_name = ?
+        args_mapping: |
+          root = [this.before.ssn_last4,
+                  this.before.last_name]
+
+      # Route inserts/updates via MERGE
+      - when: 'this.op == "c" || this.op == "u"'
+        query: |
+          MERGE INTO member_master_ht AS tgt
+          USING (
+            SELECT ? AS ssn_last4, ? AS last_name,
+                   ? AS email, ? AS phone
+          ) AS src
+          ON  tgt.ssn_last4 = src.ssn_last4
+          AND tgt.last_name = src.last_name
+          WHEN MATCHED THEN UPDATE SET
+            tgt.email   = COALESCE(src.email, tgt.email),
+            tgt.phone   = COALESCE(src.phone, tgt.phone),
+            tgt.updated_at = CURRENT_TIMESTAMP()
+          WHEN NOT MATCHED THEN INSERT
+            (member_id, ssn_last4, last_name,
+             email, phone, updated_at)
+            VALUES
+            (member_seq.NEXTVAL, src.ssn_last4,
+             src.last_name, src.email, src.phone,
+             CURRENT_TIMESTAMP())
+        args_mapping: |
+          root = [this.after.ssn_last4,
+                  this.after.last_name,
+                  this.after.email,
+                  this.after.phone]
+    max_in_flight: 4</code></pre>
+
+  <h3>Key Configuration Points</h3>
+  <ul>
+    <li><strong>Conditional queries:</strong> CDC events are routed to DELETE or MERGE based on the <code class="ic">op</code> field.</li>
+    <li><strong>Batching:</strong> Flush every 500ms or 50 messages, whichever comes first.</li>
+    <li><strong>Parallelism:</strong> <code class="ic">max_in_flight: 4</code> allows concurrent processing across Redpanda partitions while preserving ordering within each partition.</li>
+    <li><strong>COALESCE:</strong> Partial updates only overwrite non-null fields, preserving existing data.</li>
+    <li><strong>Partition key:</strong> Partition by your MERGE match key to guarantee ordering per entity.</li>
+  </ul>
+
+  <hr class="section-divider" />
+
+  <h2 id="next-steps">Next Steps</h2>
+  <ol>
+    <li><strong>Share your CDC message format</strong> (Debezium-style or custom) so we can finalize the Bloblang mappings.</li>
+    <li><strong>Share your target table DDL</strong> so we can create the Hybrid Table with the right indexes on your MERGE match columns.</li>
+    <li><strong>Partition key strategy:</strong> Confirm how your Redpanda topics are partitioned.</li>
+    <li><strong>POC:</strong> We can set up a proof-of-concept in your environment with your actual data and measure end-to-end latency.</li>
+  </ol>
+
+  <hr class="section-divider" />
+  <p style="color: light-dark(#94a3b8, #64748b); font-size: 0.85rem;">Prepared by Kurt Weinerman, Solutions Engineer, Snowflake</p>
+
+  <!-- ─── SVG Diagram Rendering ────────────────────────── -->
+  <script>
+    var isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var C = {
+      bg: isDark ? '#1e293b' : '#f8fafc',
+      bgAlt: isDark ? '#0f172a' : '#ffffff',
+      border: isDark ? '#475569' : '#cbd5e1',
+      text: isDark ? '#e2e8f0' : '#1e293b',
+      textSub: isDark ? '#94a3b8' : '#64748b',
+      red: isDark ? '#f87171' : '#dc2626',
+      redBg: isDark ? '#451a1a' : '#fef2f2',
+      redBorder: isDark ? '#991b1b' : '#fca5a5',
+      green: isDark ? '#4ade80' : '#16a34a',
+      greenBg: isDark ? '#052e16' : '#f0fdf4',
+      greenBorder: isDark ? '#166534' : '#86efac',
+      blue: isDark ? '#60a5fa' : '#2563eb',
+      blueBg: isDark ? '#172554' : '#eff6ff',
+      blueBorder: isDark ? '#1e40af' : '#93c5fd',
+      orange: isDark ? '#fb923c' : '#ea580c',
+      orangeBg: isDark ? '#431407' : '#fff7ed',
+      arrow: isDark ? '#94a3b8' : '#64748b',
+    };
+
+    function box(x, y, w, h, label, sub, fill, stroke, textColor) {
+      var r = 8;
+      var s = '<rect x="'+x+'" y="'+y+'" width="'+w+'" height="'+h+'" rx="'+r+'" fill="'+fill+'" stroke="'+stroke+'" stroke-width="1.5"/>';
+      s += '<text x="'+(x+w/2)+'" y="'+(y+h/2 - (sub?6:0))+'" text-anchor="middle" fill="'+(textColor||C.text)+'" font-size="13" font-weight="600">'+label+'</text>';
+      if (sub) s += '<text x="'+(x+w/2)+'" y="'+(y+h/2+12)+'" text-anchor="middle" fill="'+C.textSub+'" font-size="10">'+sub+'</text>';
+      return s;
+    }
+
+    function arrow(x1, y1, x2, y2, label, color, dashed) {
+      var c = color || C.arrow;
+      var dash = dashed ? ' stroke-dasharray="6,4"' : '';
+      var mid = (x1+x2)/2;
+      var s = '<line x1="'+x1+'" y1="'+y1+'" x2="'+x2+'" y2="'+y2+'" stroke="'+c+'" stroke-width="1.5"'+dash+' marker-end="url(#ah)"/>';
+      if (label) {
+        var lx = x1 === x2 ? x1 + 8 : mid;
+        var ly = y1 === y2 ? y1 - 8 : (y1+y2)/2 - 4;
+        s += '<text x="'+lx+'" y="'+ly+'" text-anchor="middle" fill="'+C.textSub+'" font-size="9">'+label+'</text>';
+      }
+      return s;
+    }
+
+    function arrowDown(x, y1, y2, label, color, dashed) { return arrow(x, y1, x, y2, label, color, dashed); }
+
+    function defs() {
+      return '<defs><marker id="ah" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse"><polygon points="0 0, 10 3.5, 0 7" fill="'+C.arrow+'"/></marker></defs>';
+    }
+
+    // ─── BEFORE diagram ───────────────────────────────
+    (function(){
+      var w=210, bw=180, bh=40, gap=52, sx=(w-bw)/2, sy=10;
+      var nodes = [
+        {l:'Source DB', s:'Core Banking', f:C.bg, st:C.border},
+        {l:'Redpanda', s:'CDC Topics', f:C.bg, st:C.border},
+        {l:'snowflake_streaming', s:'INSERT only', f:C.orangeBg, st:C.orange},
+        {l:'Landing Table', s:'Standard Table', f:C.bg, st:C.border},
+        {l:'Dynamic Table', s:'1-min refresh MERGE', f:C.redBg, st:C.red},
+        {l:'Target Table', s:'Query result', f:C.bg, st:C.border},
+        {l:'Application', s:'', f:C.bg, st:C.border},
+      ];
+      var labels = ['CDC','','INSERT','','1-min wait','',''];
+      var h = sy + nodes.length * (bh+gap) - gap + 10;
+      var svg = '<svg viewBox="0 0 '+w+' '+h+'" xmlns="http://www.w3.org/2000/svg" style="font-family:-apple-system,system-ui,sans-serif">';
+      svg += defs();
+      for (var i=0; i<nodes.length; i++) {
+        var ny = sy + i*(bh+gap);
+        svg += box(sx, ny, bw, bh, nodes[i].l, nodes[i].s, nodes[i].f, nodes[i].st);
+        if (i < nodes.length-1) {
+          svg += arrowDown(w/2, ny+bh, ny+bh+gap, labels[i], i===4?C.red:undefined, i===4);
+        }
+      }
+      svg += '</svg>';
+      document.getElementById('diagram-before').innerHTML = svg;
+    })();
+
+    // ─── AFTER diagram ────────────────────────────────
+    (function(){
+      var w=210, bw=180, bh=40, gap=52, sx=(w-bw)/2, sy=10;
+      var nodes = [
+        {l:'Source DB', s:'Core Banking', f:C.bg, st:C.border},
+        {l:'Redpanda', s:'CDC Topics', f:C.bg, st:C.border},
+        {l:'sql_raw', s:'driver: snowflake', f:C.greenBg, st:C.green},
+        {l:'Hybrid Table', s:'direct MERGE', f:C.blueBg, st:C.blue},
+        {l:'Application', s:'sub-100ms reads', f:C.bg, st:C.border},
+      ];
+      var labels = ['CDC','kafka input','MERGE INTO',''];
+      var h = sy + nodes.length * (bh+gap) - gap + 10;
+      var svg = '<svg viewBox="0 0 '+w+' '+h+'" xmlns="http://www.w3.org/2000/svg" style="font-family:-apple-system,system-ui,sans-serif">';
+      svg += defs();
+      for (var i=0; i<nodes.length; i++) {
+        var ny = sy + i*(bh+gap);
+        svg += box(sx, ny, bw, bh, nodes[i].l, nodes[i].s, nodes[i].f, nodes[i].st);
+        if (i < nodes.length-1) {
+          svg += arrowDown(w/2, ny+bh, ny+bh+gap, labels[i], C.green);
+        }
+      }
+      svg += '</svg>';
+      document.getElementById('diagram-after').innerHTML = svg;
+    })();
+
+    // ─── FULL architecture diagram (4 columns, no Debezium) ──
+    (function(){
+      var W=760, H=300;
+      var svg = '<svg viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg" style="font-family:-apple-system,system-ui,sans-serif">';
+      svg += defs();
+
+      var bw=150, bh=44, pad=16;
+      // 4 columns centered
+      var colW = W/4;
+      var cx = [colW*0.5, colW*1.5, colW*2.5, colW*3.5];
+
+      // Group backgrounds
+      function grp(col, label, h, yOff) {
+        var gx = cx[col]-bw/2-pad, gy = yOff||20, gw = bw+pad*2, gh = h||260;
+        return '<rect x="'+gx+'" y="'+gy+'" width="'+gw+'" height="'+gh+'" rx="12" fill="none" stroke="'+C.border+'" stroke-width="1" stroke-dasharray="6,3"/>'
+          + '<text x="'+(gx+10)+'" y="'+(gy+15)+'" fill="'+C.textSub+'" font-size="9" font-weight="700" letter-spacing="0.5">'+label+'</text>';
+      }
+
+      svg += grp(0, 'SQL SERVER', 160);
+      svg += grp(1, 'REDPANDA', 160);
+      svg += grp(2, 'REDPANDA CONNECT', 230);
+      svg += grp(3, 'SNOWFLAKE', 220);
+
+      // Col 0: SQL Server CDC
+      svg += box(cx[0]-bw/2, 45, bw, bh, 'SQL Server', 'Core Banking', C.bg, C.border);
+      svg += box(cx[0]-bw/2, 115, bw, bh, 'CDC Capture', 'Change tables', C.orangeBg, C.orange);
+      svg += arrowDown(cx[0], 89, 115, '', C.arrow);
+
+      // Col 1: Redpanda topics
+      svg += box(cx[1]-bw/2, 45, bw, bh, 'CDC Topics', 'member-updates', C.bg, C.border);
+      svg += box(cx[1]-bw/2, 100, bw, bh-6, 'accounts', '', C.bg, C.border);
+      svg += box(cx[1]-bw/2, 145, bw, bh-6, 'customers', '', C.bg, C.border);
+
+      // Col 2: Redpanda Connect pipeline
+      svg += box(cx[2]-bw/2, 45, bw, bh, 'kafka input', 'consumer group', C.bg, C.border);
+      svg += box(cx[2]-bw/2, 115, bw, bh, 'Event Router', 'INSERT / UPDATE / DELETE', C.bg, C.border);
+      svg += box(cx[2]-bw/2, 190, bw, bh, 'sql_raw output', 'driver: snowflake', C.greenBg, C.green);
+      svg += arrowDown(cx[2], 89, 115, '', C.green);
+      svg += arrowDown(cx[2], 159, 190, '', C.green);
+
+      // Col 3: Snowflake
+      svg += box(cx[3]-bw/2, 45, bw, bh+6, 'Hybrid Table', 'MERGE target', C.blueBg, C.blue);
+      svg += box(cx[3]-bw/2, 110, bw, 32, 'Indexes', 'ssn_last4 + last_name', C.bg, C.blueBorder);
+      svg += box(cx[3]-bw/2, 170, bw, bh, 'Application', 'sub-100ms reads', C.bg, C.border);
+      svg += arrowDown(cx[3], 95, 110, '', C.blue);
+      svg += arrowDown(cx[3], 142, 170, '', C.blue);
+
+      // Horizontal arrows between columns
+      // CDC -> Redpanda topics
+      svg += arrow(cx[0]+bw/2, 137, cx[1]-bw/2, 67, 'CDC events', C.arrow);
+
+      // Redpanda -> Redpanda Connect
+      svg += arrow(cx[1]+bw/2, 67, cx[2]-bw/2, 67, 'kafka', C.arrow);
+
+      // sql_raw -> Hybrid Table (MERGE)
+      svg += arrow(cx[2]+bw/2, 205, cx[3]-bw/2, 68, 'MERGE INTO', C.green);
+
+      svg += '</svg>';
+      document.getElementById('diagram-full').innerHTML = svg;
+    })();
+
+    // ─── Latency comparison (step boxes, not bars) ────
+    (function(){
+      var W=700, H=200;
+      var svg = '<svg viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg" style="font-family:-apple-system,system-ui,sans-serif">';
+      svg += defs();
+
+      var y1=50, y2=130, bh=36, sw=130, gap=20, lx=20;
+
+      // ── Current row ──
+      svg += '<text x="'+lx+'" y="'+(y1-14)+'" fill="'+C.red+'" font-size="13" font-weight="700">CURRENT PATH</text>';
+      var x = lx;
+      svg += box(x, y1, sw, bh, 'Snowpipe Ingest', '~3 sec', C.orangeBg, C.orange);
+      x += sw;
+      svg += arrow(x, y1+bh/2, x+gap, y1+bh/2, '', C.arrow);
+      x += gap;
+      // Make the DT box wide to show how dominant it is
+      var dtW = 280;
+      svg += box(x, y1, dtW, bh, 'Dynamic Table Refresh', '60 sec minimum', C.redBg, C.red);
+      x += dtW;
+      svg += arrow(x, y1+bh/2, x+gap, y1+bh/2, '', C.arrow);
+      x += gap;
+      svg += box(x, y1, 100, bh, 'Queryable', '63+ sec total', C.bg, C.border);
+
+      // ── Proposed row ──
+      svg += '<text x="'+lx+'" y="'+(y2-14)+'" fill="'+C.green+'" font-size="13" font-weight="700">PROPOSED PATH</text>';
+      x = lx;
+      svg += box(x, y2, sw, bh, 'Redpanda Lag', '~500ms', C.bg, C.border);
+      x += sw;
+      svg += arrow(x, y2+bh/2, x+gap, y2+bh/2, '', C.green);
+      x += gap;
+      svg += box(x, y2, sw, bh, 'sql_raw MERGE', '~150ms', C.greenBg, C.green);
+      x += sw;
+      svg += arrow(x, y2+bh/2, x+gap, y2+bh/2, '', C.green);
+      x += gap;
+      svg += box(x, y2, 130, bh, 'Queryable', 'under 3 sec total', C.greenBg, C.green);
+
+      svg += '</svg>';
+      document.getElementById('diagram-latency').innerHTML = svg;
+    })();
+  </script>
+</body>
+</html>

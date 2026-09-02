@@ -1,0 +1,164 @@
+# =============================================================================
+# Redpanda Connect: sql_raw -> Snowflake Hybrid Table (MERGE)
+# =============================================================================
+#
+# PURPOSE: Reference config showing how to replace the current architecture:
+#
+#   BEFORE (1-min latency):
+#   Redpanda -> snowflake_streaming -> landing table -> Dynamic Table (MERGE)
+#
+#   AFTER (sub-5-sec latency):
+#   Redpanda -> sql_raw (driver: snowflake) -> MERGE INTO hybrid table
+#
+# WHY THIS WORKS:
+# - snowflake_streaming uses the Snowpipe Streaming API (insert-only, no hybrid table support)
+# - sql_raw uses a standard SQL driver connection (full DML: MERGE, UPDATE, DELETE on hybrid tables)
+# - Hybrid tables provide row-level locking, so concurrent MERGE + reads don't block each other
+# - Secondary indexes on the MERGE ON columns (ssn_last4, last_name) make matching O(1)
+#
+# LATENCY EXPECTATIONS:
+# - Redpanda consumer lag: ~100-500ms (depends on batching config)
+# - SQL MERGE execution: ~50-150ms per row (indexed hybrid table)
+# - End-to-end: typically 1-3 seconds from source write to queryable in Snowflake
+#
+# PREREQUISITE: Create the hybrid table in Snowflake first:
+#   CREATE HYBRID TABLE member_master_ht (
+#       member_id       NUMBER PRIMARY KEY,
+#       ssn_last4       CHAR(4) NOT NULL,
+#       first_name      VARCHAR(50),
+#       last_name       VARCHAR(50) NOT NULL,
+#       email           VARCHAR(100),
+#       phone           VARCHAR(20),
+#       street          VARCHAR(100),
+#       city            VARCHAR(50),
+#       state           CHAR(2),
+#       zip             CHAR(10),
+#       source_system   VARCHAR(30) DEFAULT 'CORE',
+#       updated_at      TIMESTAMP_NTZ,
+#       source_updated_at TIMESTAMP_NTZ,
+#       INDEX idx_ssn_name (ssn_last4, last_name),
+#       INDEX idx_email (email)
+#   );
+#   CREATE SEQUENCE member_master_ht_seq START = 1 INCREMENT = 1;
+# =============================================================================
+
+input:
+  kafka:
+    addresses: ["${REDPANDA_BROKERS}"]
+    topics: ["member-cdc-events"]
+    consumer_group: "snowflake-merge-consumer"
+    # Batch messages for efficiency -- flush every 500ms or 50 messages
+    batching:
+      count: 50
+      period: "500ms"
+
+pipeline:
+  processors:
+    - log:
+        message: "Processing ${! batch_size() } CDC events"
+
+output:
+  sql_raw:
+    driver: snowflake
+    # DSN format for key pair auth:
+    # user@account/database/schema?warehouse=WH&role=ROLE&authenticator=snowflake_jwt&privateKey=BASE64URL_KEY
+    dsn: "${SNOWFLAKE_USER}@${SNOWFLAKE_ACCOUNT}/${SNOWFLAKE_DB}/${SNOWFLAKE_SCHEMA}?warehouse=${SNOWFLAKE_WH}&role=${SNOWFLAKE_ROLE}&authenticator=snowflake_jwt&privateKey=${SNOWFLAKE_PRIVATE_KEY_B64URL}"
+
+    # Connection pool settings
+    conn_max_open: 8
+    conn_max_idle: 4
+    conn_max_life_time: "5m"
+
+    # Conditional queries: route by CDC operation type
+    queries:
+      # --- DELETE operations ---
+      - when: 'this.op == "d"'
+        query: |
+          DELETE FROM member_master_ht
+          WHERE ssn_last4 = ? AND last_name = ?
+        args_mapping: |
+          root = [this.before.ssn_last4, this.before.last_name]
+        exec_only: true
+
+      # --- INSERT / UPDATE / SNAPSHOT operations via MERGE ---
+      - when: 'this.op == "c" || this.op == "u" || this.op == "r"'
+        query: |
+          MERGE INTO member_master_ht AS tgt
+          USING (
+              SELECT ? AS ssn_last4, ? AS last_name, ? AS first_name,
+                     ? AS email, ? AS phone, ? AS street,
+                     ? AS city, ? AS state, ? AS zip, ? AS source_ts
+          ) AS src
+          ON tgt.ssn_last4 = src.ssn_last4 AND tgt.last_name = src.last_name
+          WHEN MATCHED THEN UPDATE SET
+              tgt.first_name        = COALESCE(src.first_name, tgt.first_name),
+              tgt.email             = COALESCE(src.email, tgt.email),
+              tgt.phone             = COALESCE(src.phone, tgt.phone),
+              tgt.street            = COALESCE(src.street, tgt.street),
+              tgt.city              = COALESCE(src.city, tgt.city),
+              tgt.state             = COALESCE(src.state, tgt.state),
+              tgt.zip               = COALESCE(src.zip, tgt.zip),
+              tgt.source_system     = 'REDPANDA_CDC',
+              tgt.updated_at        = CURRENT_TIMESTAMP(),
+              tgt.source_updated_at = src.source_ts
+          WHEN NOT MATCHED THEN INSERT
+              (member_id, ssn_last4, last_name, first_name, email, phone,
+               street, city, state, zip, source_system, updated_at, source_updated_at)
+              VALUES
+              (member_master_ht_seq.NEXTVAL, src.ssn_last4, src.last_name,
+               src.first_name, src.email, src.phone, src.street,
+               src.city, src.state, src.zip,
+               'REDPANDA_CDC', CURRENT_TIMESTAMP(), src.source_ts)
+        args_mapping: |
+          root = [
+            this.after.ssn_last4,
+            this.after.last_name,
+            this.after.first_name,
+            this.after.email,
+            this.after.phone,
+            this.after.street,
+            this.after.city,
+            this.after.state,
+            this.after.zip,
+            this.after.source_ts
+          ]
+        exec_only: true
+
+    # Batching at the output level for throughput
+    batching:
+      count: 100
+      period: "500ms"
+
+    # Parallelism: one in-flight batch per Redpanda partition
+    # Increase for higher throughput across partitions
+    max_in_flight: 4
+
+
+# =============================================================================
+# NOTES FOR IMPLEMENTATION:
+#
+# 1. CDC MESSAGE FORMAT:
+#    Adjust args_mapping based on your CDC format. Common formats:
+#    - Debezium: { "before": {...}, "after": {...}, "op": "c|u|d|r", "source": {...} }
+#    - Custom:   { "operation": "insert|update|delete", "before": {...}, "after": {...} }
+#
+# 2. PARTITION KEY:
+#    Partition Redpanda topic by the MERGE match key (e.g., ssn_last4 + last_name)
+#    to guarantee ordering for the same member across updates.
+#
+# 3. WHY NOT snowflake_streaming?
+#    - Snowpipe Streaming API is INSERT-ONLY (cannot MERGE, UPDATE, or DELETE)
+#    - Snowpipe Streaming does NOT support hybrid tables as a target
+#    - sql_raw uses a standard SQL connection which has full DML support
+#
+# 4. WHY HYBRID TABLES?
+#    - Row-level locking: concurrent MERGEs don't block reads
+#    - Secondary indexes: MERGE ON clause is an indexed lookup, not a scan
+#    - Enforced primary keys: prevents duplicates
+#    - Sub-100ms point reads for the application layer
+#
+# 5. SCALING:
+#    - Increase max_in_flight for more partitions
+#    - Increase batch count for higher throughput (trades latency for throughput)
+#    - Hybrid table quota: ~16,000 ops/sec per database
+# =============================================================================

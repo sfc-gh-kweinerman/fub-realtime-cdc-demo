@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.pyc
+streaming/.env
+streaming/rsa_key*
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+app/.env.local
+
+# Docker volumes
+docker/sqlserver/data/
+docker/redpanda-connect/.env
+
+# Logs
+app/snowflake.log
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/settings.json
+
+# Snowflake CLI
+.snowflake/credentials
+.snowflake/
